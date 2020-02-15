@@ -1,6 +1,8 @@
 # AWS Security Monitoring Stack CFT for use with Splunk HEC
 CFT that creates CloudWatch Alerts and Events that are sent to both an SNS topic and Kinesis. The Kinesis Firehose Streams are then sent to Splunk via HTTP Event Collector (HEC). This CFT also creates the minimum necessary IAM roles and policies needed.
 
+![Architecture Layout](Architecture_SM.jpg)
+
 ## Prerequisites and recommendations
 ### Splunk
 1. Kinesis requires Splunk HEC to have a trusted CA-signed certificate. Self-signed certificates are not supported. **Required**
