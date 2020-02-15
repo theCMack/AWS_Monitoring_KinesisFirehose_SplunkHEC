@@ -1,0 +1,842 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Security Monitoring Alerts and Events sent to Splunk, via Kinesis Firehose
+Parameters: 
+        SplunkHECEndpoint: 
+          Description: URL and port to Splunk HEC endpoint
+          Type: String
+          Default: "https://<SPLUNK ENDPOINT>:8088"
+        SplunkHECToken: 
+          Description: Splunk HEC token
+          Type: String
+          Default: "<SPLUNK HEC TOKEN>"
+        SplunkS3BackupMode: 
+          Description: All of failed events only sent to S3
+          Type: String
+          Default: FailedEventsOnly
+          AllowedValues: 
+            - FailedEventsOnly
+            - AllEvents
+        SplunkS3ErrorOutputPrefix: 
+          Description: Prefix used for errors sent to S3
+          Type: String
+          Default: "errors/result=!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd}"
+        CloudtrailLogGroup:
+          Description: LogGroup for all of the Cloudtrail
+          Type: String
+          Default: <CLOUDTRAIL LOG GROUP>
+        LambdaProcessorS3Bucket:
+          Description: S3 bucket that contains the lambda function
+          Type: String
+          Default: <SOME S3 BUCKET>
+        LambdaProcessorFunctionZIP:
+          Description: Key name of lambda zip in the S3 bucket
+          Type: String
+          Default: <CLOUDWATCHLOGSPROCESSOR.ZIP>
+        SNSSubscriptionEmailAlerts:
+          Description: Email address for SNS Topic subscription for the Alerts. 
+          Type: String
+          Default: example@email.com
+        SNSSubscriptionEmailEvents:
+          Description: Email address for SNS Topic subscription for the Events. 
+          Type: String
+          Default: example@email.com
+Resources:
+  KinesisFirehoseS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: KinesisFirehoseS3
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub firehose.amazonaws.com
+          Action:
+          - sts:AssumeRole
+  KinesisFirehoseS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: KinesisFirehoseS3Policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action:
+          - s3:AbortMultipartUpload
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:ListBucket
+          - s3:ListBucketMultipartUploads
+          - s3:PutObject
+          Effect: Allow
+          Resource:
+          - !Sub arn:aws:s3:::kinesisfirehoses3-${AWS::AccountId}
+          - !Sub arn:aws:s3:::kinesisfirehoses3-${AWS::AccountId}/*
+      Roles: [!Ref KinesisFirehoseS3Role]
+  CloudWatchFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CloudWatchFirehose
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:  
+            - !Sub logs.${AWS::Region}.amazonaws.com
+            - events.amazonaws.com
+          Action:
+          - sts:AssumeRole
+  CloudWatchFirehosePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CloudWatchFirehosePolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action:
+          - firehose:*
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Effect: Allow
+          Resource: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:*"
+        - Action:
+          - iam:PassRole
+          Effect: Allow
+          Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/CloudWatchFirehoseRole"
+      Roles: [!Ref CloudWatchFirehoseRole]
+    DependsOn: CloudWatchFirehoseRole
+  LambdaProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaProcessor
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:  
+            - firehose.amazonaws.com  
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+  LambdaProcessorPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaProcessorPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action:
+          - lambda:InvokeFunction
+          - lambda:GetFunctionConfiguration
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Effect: Allow
+          Resource: 
+          - !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:*"
+          - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:*"
+          - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Roles: [!Ref LambdaProcessorRole]
+  CloudWatchLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: SecurityMonitorStackLogGroup
+      RetentionInDays: 30
+  CloudWatchLogStreamedAlerts:
+    Type: 'AWS::Logs::LogStream'
+    Properties:
+      LogGroupName: SecurityMonitorStackLogGroup
+      LogStreamName: SecurityMonitorStackLogStreamAlerts
+    DependsOn: CloudWatchLogGroup
+  CloudWatchLogStreamedEvents:
+    Type: 'AWS::Logs::LogStream'
+    Properties:
+      LogGroupName: SecurityMonitorStackLogGroup
+      LogStreamName: SecurityMonitorStackLogStreamEvents
+    DependsOn: CloudWatchLogGroup
+  KinesisFirehoseS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub kinesisfirehoses3-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+    DependsOn: CloudWatchLogGroup
+  LambdaProcessorFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: lambda_function.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LambdaProcessor" 
+      Code: 
+        S3Bucket: !Sub "LambdaProcessorS3Bucket"
+        S3Key: !Sub "LambdaProcessorFunctionZIP"
+      Runtime: python2.7
+      Timeout: 300
+  SNSTopicSecurityMonitoringAlerts:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: SecurityMonitoringTopicAlerts
+  SNSTopicSecurityMonitoringSubscriptionAlerts:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub ${SNSSubscriptionEmailAlerts}
+      Protocol: email
+      TopicArn: !Ref 'SNSTopicSecurityMonitoringAlerts'
+    DependsOn: SNSTopicSecurityMonitoringAlerts
+  SNSTopicSecurityMonitoringEvents:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: SecurityMonitoringTopicEvents
+  SNSTopicSecurityMonitoringSubscriptionEvents:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub ${SNSSubscriptionEmailEvents}
+      Protocol: email
+      TopicArn: !Ref 'SNSTopicSecurityMonitoringEvents'
+    DependsOn: SNSTopicSecurityMonitoringEvents
+  CloudWatchAlarmFailedConsoleLogin:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: failed_console_logins
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers if there are AWS Management Console
+        authentication failures.
+      MetricName: ConsoleLoginFailures
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterFailedConsoleLogin:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.eventName = ConsoleLogin) && ($.errorMessage = "Failed
+        authentication") }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: ConsoleLoginFailures
+  CloudWatchAlarmVPCChanges:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: vpc_changes
+      AlarmDescription: A CloudWatch Alarm that triggers when changes are made to a VPC.
+      MetricName: VpcEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterVPCChanges:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.eventName = CreateVpc) || ($.eventName = DeleteVpc) || ($.eventName
+        = ModifyVpcAttribute) || ($.eventName = AcceptVpcPeeringConnection) ||
+        ($.eventName = CreateVpcPeeringConnection) || ($.eventName =
+        DeleteVpcPeeringConnection) || ($.eventName =
+        RejectVpcPeeringConnection) || ($.eventName = AttachClassicLinkVpc) ||
+        ($.eventName = DetachClassicLinkVpc) || ($.eventName =
+        DisableVpcClassicLink) || ($.eventName = EnableVpcClassicLink) }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: VpcEventCount
+  CloudWatchAlarmIGWChanges:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: igw_changes
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers when changes are made to an Internet
+        Gateway in a VPC.
+      MetricName: GatewayEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterIGWChanges:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.eventName = CreateCustomerGateway) || ($.eventName =
+        DeleteCustomerGateway) || ($.eventName = AttachInternetGateway) ||
+        ($.eventName = CreateInternetGateway) || ($.eventName =
+        DeleteInternetGateway) || ($.eventName = DetachInternetGateway) }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: GatewayEventCount
+  CloudWatchAlarmVPCRouteTableChanges:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: vpc_routetable_changes
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers when changes are made to a VPC's Route
+        Table.
+      MetricName: VpcRouteTableEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterVPCRouteTableChanges:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.eventName = AssociateRouteTable) || ($.eventName = CreateRoute) ||
+        ($.eventName = CreateRouteTable) || ($.eventName = DeleteRoute) ||
+        ($.eventName = DeleteRouteTable) || ($.eventName = ReplaceRoute) ||
+        ($.eventName = ReplaceRouteTableAssociation) || ($.eventName =
+        DisassociateRouteTable) }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: VpcRouteTableEventCount
+  CloudWatchAlarmUnauthorizedAPICalls:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: unauthorized_api_calls
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers if Multiple unauthorized actions or
+        logins attempted.
+      MetricName: UnauthorizedAttemptCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '60'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterUnauthorizedAPICalls:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.errorCode = "*UnauthorizedOperation") || ($.errorCode =
+        "AccessDenied*") }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: UnauthorizedAttemptCount
+  CloudWatchAlarmRootAccountLogin:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: root_account_login
+      AlarmDescription: A CloudWatch Alarm that triggers if a root user uses the account.
+      MetricName: RootUserEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '60'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterRootAccountLogin:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.userIdentity.type = "Root") && ($.userIdentity.invokedBy NOT
+        EXISTS) && ($.eventType != "AwsServiceEvent") }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: RootUserEventCount
+  CloudWatchAlarmNoMFAConsoleLogin:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: no_mfa_console_logins
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers if there is a Management Console
+        sign-in without MFA.
+      MetricName: ConsoleSigninWithoutMFA
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '60'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterNoMFAConsoleLogin:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        {($.eventName = "ConsoleLogin") && ($.additionalEventData.MFAUsed !=
+        "Yes") && ($.responseElements.ConsoleLogin != "Failure") &&
+        ($.additionalEventData.SamlProviderArn NOT EXISTS) }
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: ConsoleSigninWithoutMFA
+  CloudWatchAlarmIAMUserChanges:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: iam_user_changes
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers when changes are made to IAM users.
+        Events include IAM user creation/deletion/update operations, updating
+        IAM user passwords or Access Keys, as well as attaching/detaching
+        policies from IAM users or groups.
+      MetricName: IAMPolicyEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: SNSTopicSecurityMonitoringAlerts
+      TreatMissingData: notBreaching
+  MetricFilterIAMUserChanges:
+    Type: 'AWS::Logs::MetricFilter'
+    Properties:
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        {($.eventName=AddUserToGroup)||($.eventName=ChangePassword)||($.eventName=CreateAccessKey)||
+        ($.eventName=CreateUser)||($.eventName=UpdateAccessKey)||($.eventName=UpdateGroup)||
+        ($.eventName=UpdateUser)||($.eventName=AttachGroupPolicy)||($.eventName=AttachUserPolicy)||
+        ($.eventName=DeleteUserPolicy)||($.eventName=DetachGroupPolicy)||($.eventName=DetachUserPolicy)||($.eventName=PutUserPolicy)}
+      MetricTransformations:
+        - MetricValue: '1'
+          MetricNamespace: CloudTrailMetrics
+          MetricName: IAMPolicyEventCount
+  KinesisFirehoseProcessed:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: SecurityMonitorStackFirehoseProcessed
+      DeliveryStreamType: DirectPut
+      SplunkDestinationConfiguration: 
+        CloudWatchLoggingOptions: 
+          Enabled: Yes
+          LogGroupName: "SecurityMonitorStackLogGroup"
+          LogStreamName: "SecurityMonitorStackLogStreamAlerts"
+        HECAcknowledgmentTimeoutInSeconds: 180
+        HECEndpoint: !Sub ${SplunkHECEndpoint}
+        HECEndpointType: Raw
+        HECToken: !Sub ${SplunkHECToken}
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: 
+                    Fn::GetAtt: 
+                      - "LambdaProcessorFunction"
+                      - "Arn" 
+                - ParameterName: RoleArn
+                  ParameterValue: !Sub "arn:aws:iam::${AWS::AccountId}:role/LambdaProcessor" 
+              Type: Lambda 
+        RetryOptions: 
+          DurationInSeconds: 300
+        S3BackupMode: !Sub ${SplunkS3BackupMode}
+        S3Configuration: 
+          BucketARN: 
+            Fn::GetAtt: 
+              - "KinesisFirehoseS3Bucket"
+              - "Arn"
+          BufferingHints: 
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CloudWatchLoggingOptions: 
+            Enabled: Yes
+            LogGroupName: "SecurityMonitorStackLogGroup"
+            LogStreamName: "SecurityMonitorStackLogStreamAlerts"
+          CompressionFormat: UNCOMPRESSED
+          ErrorOutputPrefix: !Sub "KinesisFirehoseProcessed-${SplunkS3ErrorOutputPrefix}"
+          RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/KinesisFirehoseS3"
+    DependsOn: KinesisFirehoseS3Bucket
+  SubscriptionFilterFirehoseProcessed: 
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/CloudWatchFirehose"
+      LogGroupName: !Sub ${CloudtrailLogGroup}
+      FilterPattern: >-
+        { ($.eventName = ConsoleLogin) && ($.errorMessage = "Failed  authentication") ||
+        ($.eventName = *Vpc) || ($.eventName = ModifyVpcAttribute) || ($.eventName = *pcPeeringConnection) || ($.eventName = *ClassicLinkVpc) ||
+        ($.eventName = *CustomerGateway) || ($.eventName = *RouteTable) || ($.eventName = *Route) || ($.eventName = ReplaceRouteTableAssociation) || 
+        ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") || ($.userIdentity.type = "Root") && ($.userIdentity.invokedBy NOT EXISTS) && ($.eventType != "AwsServiceEvent") ||
+        ($.eventName = "ConsoleLogin") && ($.additionalEventData.MFAUsed != "Yes") && ($.responseElements.ConsoleLogin != "Failure") && ($.additionalEventData.SamlProviderArn NOT EXISTS) ||
+        ($.eventName = AddUserToGroup) || ($.eventName = ChangePassword) || ($.eventName = *AccessKey) || ($.eventName = *User) || 
+        ($.eventName = UpdateAccessKey) || ($.eventName = UpdateGroup) || ($.eventName = *GroupPolicy) || ($.eventName = *UserPolicy) }
+      DestinationArn: 
+        Fn::GetAtt: 
+          - "KinesisFirehoseProcessed"
+          - "Arn"
+    DependsOn: KinesisFirehoseProcessed
+  EventRuleDetectAWSConfigChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-config-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to AWS Config and 
+        publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - config.amazonaws.com
+          eventName:
+            - PutConfigurationRecorder
+            - StopConfigurationRecorder
+            - DeleteDeliveryChannel
+            - PutDeliveryChannel
+  EventRuleDetectCloudtrailChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-cloudtrail-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to CloudTrail configutations
+        and publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - cloudtrail.amazonaws.com
+          eventName:
+            - StopLogging
+            - DeleteTrail
+            - UpdateTrail
+  EventRuleDetectIAMPolicyChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-iam-policy-changes
+      Description: >-
+        A CloudWatch Event Rule that detects IAM policy changes
+        and publishes to SNS and Kinesis Firehose. Events include IAM
+        policy creation/deletion/update operations as well as
+        attaching/detaching policies from IAM users, roles or groups.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - DeleteRolePolicy
+            - DeleteUserPolicy
+            - PutGroupPolicy
+            - PutRolePolicy
+            - PutUserPolicy
+            - CreatePolicy
+            - DeletePolicy
+            - CreatePolicyVersion
+            - DeletePolicyVersion
+            - AttachRolePolicy
+            - DetachRolePolicy
+            - AttachUserPolicy
+            - DetachUserPolicy
+            - AttachGroupPolicy
+            - DetachGroupPolicy
+  EventRuleDetectS3BucketPolicyChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-s3-bucket-policy-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to S3 bucket policies and
+        publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutBucketAcl
+            - PutBucketPolicy
+            - PutBucketCors
+            - PutBucketLifecycle
+            - PutBucketReplication
+            - DeleteBucketPolicy
+            - DeleteBucketCors
+            - DeleteBucketLifecycle
+            - DeleteBucketReplication
+  EventRuleDetectNetworkChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-network-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to network configuration
+        and publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AttachInternetGateway
+            - AssociateRouteTable
+            - CreateCustomerGateway
+            - CreateInternetGateway
+            - CreateRoute
+            - CreateRouteTable
+            - DeleteCustomerGateway
+            - DeleteInternetGateway
+            - DeleteRoute
+            - DeleteRouteTable
+            - DeleteDhcpOptions
+            - DetachInternetGateway
+            - DisassociateRouteTable
+            - ReplaceRoute
+            - ReplaceRouteTableAssociation
+  EventRuleDetectKMSCMKChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-kms-cmk-operations
+      Description: >-
+        A CloudWatch Event Rule that detects KMS Customer Master Key (CMK)
+        changes and publishes to SNS and Kinesis Firehose.
+        Events include key creation, deletion, or key enabling/disabling
+        operations, imported key material operations, as well as updates to CMK
+        key policies.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - kms.amazonaws.com
+          eventName:
+            - DisableKey
+            - ScheduleKeyDeletion
+            - CancelKeyDeletion
+            - CreateKey
+            - CreateAlias
+            - EnableKey
+            - PutKeyPolicy
+            - ImportKeyMaterial
+            - DeleteImportedKeyMaterial
+  EventRuleDetectSecurityGroupChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-security-group-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to security groups and
+        publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - RevokeSecurityGroupEgress
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+  EventRuleDetectNetworkACLChanges:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: detect-network-acl-changes
+      Description: >-
+        A CloudWatch Event Rule that detects changes to network ACLs and
+        publishes to SNS and Kinesis Firehose.
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "KinesisFirehose"
+              - "Arn" 
+          RoleArn: 
+            Fn::GetAtt: 
+              - "CloudWatchFirehoseRole"
+              - "Arn"
+          Id: "target-id1"
+        -
+          Arn:
+            Ref: SNSTopicSecurityMonitoringEvents 
+          Id: "target-id2"
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - CreateNetworkAcl
+            - CreateNetworkAclEntry
+            - DeleteNetworkAcl
+            - DeleteNetworkAclEntry
+            - ReplaceNetworkAclEntry
+            - ReplaceNetworkAclAssociation
+  KinesisFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: SecurityMonitorStackFirehose
+      DeliveryStreamType: DirectPut
+      SplunkDestinationConfiguration: 
+        CloudWatchLoggingOptions: 
+          Enabled: Yes
+          LogGroupName: "SecurityMonitorStackLogGroup"
+          LogStreamName: "SecurityMonitorStackLogStreamEvents"
+        HECAcknowledgmentTimeoutInSeconds: 180
+        HECEndpoint: !Sub ${SplunkHECEndpoint}
+        HECEndpointType: Raw
+        HECToken: !Sub ${SplunkHECToken}
+        RetryOptions: 
+          DurationInSeconds: 300
+        S3BackupMode: !Sub ${SplunkS3BackupMode}
+        S3Configuration: 
+          BucketARN: 
+            Fn::GetAtt: 
+              - "KinesisFirehoseS3Bucket"
+              - "Arn"
+          BufferingHints: 
+            IntervalInSeconds: 300
+            SizeInMBs: 5
+          CloudWatchLoggingOptions: 
+            Enabled: Yes
+            LogGroupName: "SecurityMonitorStackLogGroup"
+            LogStreamName: "SecurityMonitorStackLogStreamEvents"
+          CompressionFormat: UNCOMPRESSED
+          ErrorOutputPrefix: !Sub "KinesisFirehose-${SplunkS3ErrorOutputPrefix}"
+          RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/KinesisFirehoseS3"
+    DependsOn: KinesisFirehoseS3Bucket
